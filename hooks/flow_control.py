@@ -14,6 +14,16 @@ So this hook does two things on every request:
 
 Precedence is most-specific-first: key alias, then user, then team, then the
 default. See objectives.yaml for the mapping itself.
+
+A rule may also set `demote_at`, a saturation fraction of the caller's normal
+LiteLLM rate limits (tpm_limit / rpm_limit on the key, user or team). The hook
+reads the v3 parallel request limiter's own counters -- the same numbers it
+reports as x-ratelimit-* response headers -- and once the most-saturated limit
+crosses `demote_at`, requests go out stamped with a lower objective
+(`demote_to`, default "best-effort") instead of being rejected. The hard 429
+at 100% stays, as the limiter still enforces it; `demote_at` carves a soft
+band underneath it. No counters of our own: with Redis configured on the
+proxy, saturation is cluster-wide for free.
 """
 
 from __future__ import annotations
@@ -30,13 +40,16 @@ from litellm.proxy._types import UserAPIKeyAuth
 
 OBJECTIVE_HEADER = "x-llm-d-inference-objective"
 FAIRNESS_HEADER = "x-llm-d-inference-fairness-id"
-FLOW_CONTROL_HEADERS = (OBJECTIVE_HEADER, FAIRNESS_HEADER)
+SATURATION_HEADER = "x-litellm-ratelimit-saturation"
+FLOW_CONTROL_HEADERS = (OBJECTIVE_HEADER, FAIRNESS_HEADER, SATURATION_HEADER)
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "objectives.yaml"
 
 # Fields on the authenticated key that a fairness id may be derived from.
 # `api_key` is the salted hash of the virtual key, not the key itself.
 IDENTITY_FIELDS = ("key_alias", "user_id", "team_id", "end_user_id", "api_key")
+
+DEFAULT_DEMOTE_OBJECTIVE = "best-effort"
 
 
 class FlowControlHook(CustomLogger):
@@ -145,6 +158,83 @@ class FlowControlHook(CustomLogger):
                 return str(value)
         return None
 
+    # ------------------------------------------------------------ saturation
+
+    async def _get_saturation(
+        self,
+        user_api_key_dict: UserAPIKeyAuth,
+        data: dict,
+        call_type: str,
+    ) -> float | None:
+        """Max saturation (0.0-1.0+) across the caller's v3 limiter windows.
+
+        Reuses the v3 parallel request limiter's own counters rather than
+        keeping any of our own. Two paths, cheapest first:
+
+        - If the limiter's pre-call already ran for this request, its
+          RateLimitResponse is stashed on a ContextVar: read it back, zero
+          cache reads. (Those are the exact numbers it later mirrors into the
+          x-ratelimit-* response headers.)
+        - Otherwise build the same descriptors the limiter would and call
+          should_rate_limit(read_only=True): the in-memory tier of its
+          internal DualCache answers first (kept warm by every enforced
+          request), Redis fills the gaps -- slightly stale cross-instance,
+          which is fine for a priority decision.
+
+        These are internal LiteLLM APIs (verified against 1.99.0), so any
+        failure degrades to "no saturation signal", never to a failed request.
+        """
+        try:
+            from litellm.proxy.hooks.parallel_request_limiter_v3 import (
+                _PROXY_MaxParallelRequestsHandler_v3,
+                get_request_stash_for_call,
+            )
+            from litellm.proxy.proxy_server import proxy_logging_obj
+
+            limiter = proxy_logging_obj.get_proxy_hook("parallel_request_limiter")
+            if not isinstance(limiter, _PROXY_MaxParallelRequestsHandler_v3):
+                return None
+
+            stash = get_request_stash_for_call(data.get("litellm_call_id"))
+            response = stash.rate_limit_response if stash is not None else None
+
+            if response is None:
+                metadata = user_api_key_dict.metadata or {}
+                descriptors = limiter._create_rate_limit_descriptors(
+                    user_api_key_dict=user_api_key_dict,
+                    data=data,
+                    rpm_limit_type=metadata.get("rpm_limit_type"),
+                    tpm_limit_type=metadata.get("tpm_limit_type"),
+                    model_has_failures=False,
+                    call_type=call_type,
+                )
+                if not descriptors:
+                    return None
+                response = await limiter.should_rate_limit(
+                    descriptors=descriptors,
+                    parent_otel_span=user_api_key_dict.parent_otel_span,
+                    read_only=True,
+                )
+
+            saturation = None
+            for status in response["statuses"]:
+                limit = status.get("current_limit") or 0
+                if limit <= 0:
+                    continue
+                used = max(limit - status.get("limit_remaining", limit), 0)
+                saturation = max(saturation or 0.0, used / limit)
+            return saturation
+        except Exception as exc:  # noqa: BLE001 -- a broken read must not break traffic
+            verbose_proxy_logger.warning("flow_control: saturation read failed: %s", exc)
+            return None
+
+    def _demote_objective(self, rule: dict[str, Any]) -> str:
+        return str(
+            rule.get("demote_to")
+            or self.defaults.get("demote_objective")
+            or DEFAULT_DEMOTE_OBJECTIVE
+        )
+
     # --------------------------------------------------------------- headers
 
     @staticmethod
@@ -193,6 +283,23 @@ class FlowControlHook(CustomLogger):
             return data
 
         injected = {OBJECTIVE_HEADER: str(objective)}
+
+        demote_at = rule.get("demote_at") or self.defaults.get("demote_at")
+        if demote_at is not None:
+            saturation = await self._get_saturation(user_api_key_dict, data, call_type)
+            if saturation is not None:
+                injected[SATURATION_HEADER] = f"{saturation:.4f}"
+                if saturation >= float(demote_at):
+                    objective = self._demote_objective(rule)
+                    injected[OBJECTIVE_HEADER] = objective
+                    verbose_proxy_logger.info(
+                        "flow_control: %s at %.0f%% of its rate limits (demote_at=%.0f%%) -> %s",
+                        why,
+                        saturation * 100,
+                        float(demote_at) * 100,
+                        objective,
+                    )
+
         fairness_id = self._fairness_id(rule, user_api_key_dict)
         if fairness_id:
             injected[FAIRNESS_HEADER] = fairness_id
@@ -207,7 +314,7 @@ class FlowControlHook(CustomLogger):
         verbose_proxy_logger.info(
             "flow_control: %s -> objective=%s fairness_id=%s (matched %s)",
             model,
-            objective,
+            injected[OBJECTIVE_HEADER],
             fairness_id,
             why,
         )

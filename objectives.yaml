@@ -29,3 +29,17 @@ keys:
 
   lightwell:
     objective: standard
+
+  # Saturation-based demotion, driven by LiteLLM's own v3 rate limiter
+  # counters (the numbers behind the x-ratelimit-* response headers), not by
+  # anything this hook tracks itself. meridian's key has tpm_limit: 1000
+  # (poc_keys.yaml); once the most-saturated of its limits crosses demote_at,
+  # requests are stamped `demote_to` instead of premium -- still admitted.
+  # The limiter's own hard 429 at 100% remains the backstop.
+  #
+  # demote_at is tiny (0.4% = 4 of 1000 tokens) so the POC crosses it in two
+  # requests; real values would be 0.5-0.9.
+  meridian:
+    objective: premium
+    demote_at: 0.004
+    demote_to: best-effort

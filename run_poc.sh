@@ -113,6 +113,15 @@ run_case "spoof stripped" lightwell-key standard lightwell \
   -H "x-llm-d-inference-objective: premium" \
   -H "x-llm-d-inference-fairness-id: forge"
 
+# saturation demotion: meridian's key has a real LiteLLM tpm_limit (1000) and
+# the hook reads the v3 rate limiter's own counters. The mock bills 2 tokens
+# per request, so saturation runs 0.0000, 0.0020, 0.0040 -- and the third
+# request crosses demote_at: 0.004 and goes out best-effort, still admitted.
+# All three land inside one 60s limiter window (requests take well under that).
+run_case "saturation: 1st premium" meridian-key premium meridian
+run_case "saturation: 2nd premium" meridian-key premium meridian
+run_case "saturation: demoted" meridian-key best-effort meridian
+
 echo
 if [[ $failures -eq 0 ]]; then
   echo "all cases passed"

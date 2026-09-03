@@ -12,3 +12,12 @@ lightwell-key:
   key_alias: lightwell
   user_id: ci@example.com
   team_id: team-batch-eval
+
+meridian-key:
+  key_alias: meridian
+  user_id: batch@example.com
+  team_id: team-batch-eval
+  # A real LiteLLM key limit (`litellm keys create ... --tpm-limit`): the v3
+  # parallel request limiter tracks + enforces it (429 at 100%), and the flow
+  # control hook reads the same counters to demote at `demote_at` before that.
+  tpm_limit: 1000

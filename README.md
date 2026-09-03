@@ -8,8 +8,11 @@ llm-d's flow control admits requests by reading two headers at the EPP:
 | `x-llm-d-inference-fairness-id` | the flow id used for fair sharing *within* that band |
 
 In LiteLLM, a pre-call hook:
-1. **strips** `x-llm-d-*` flow control headers off whatever the client sent, and
-2. **injects** them from a static mapping of LiteLLM identity -> objective.
+1. **strips** `x-llm-d-*` flow control headers off whatever the client sent,
+2. **injects** them from a mapping of LiteLLM identity -> objective, and
+3. **demotes** callers nearing their LiteLLM rate limits to a lower band
+   (see [Saturation demotion](#saturation-demotion-reusing-litellms-rate-limit-counters))
+   -- traffic keeps flowing, just at lower priority, instead of a 429.
 
 ## Layout
 
@@ -39,6 +42,9 @@ First run builds `./.venv` (~1 min); after that it takes a few seconds.
 PASS key rule: forge            premium            forge
 PASS key rule: lightwell        standard           lightwell
 PASS spoof stripped             standard           lightwell
+PASS saturation: 1st premium    premium            meridian
+PASS saturation: 2nd premium    premium            meridian
+PASS saturation: demoted        best-effort        meridian
 
 all cases passed
 ```
@@ -91,6 +97,53 @@ band:
 `models:` at the top of the file scopes injection to the llm-d-backed model
 groups, so anything else behind the same proxy is left alone.
 
+## Saturation demotion: reusing LiteLLM's rate limit counters
+
+The hook keeps **no counters of its own**. The limits are LiteLLM's ordinary
+`tpm_limit` / `rpm_limit` on the key, user or team, and the numbers come from
+the v3 parallel request limiter's own tracking -- the same counters it mirrors
+into the `x-ratelimit-{descriptor}-{remaining,limit}-{requests,tokens}`
+response headers. A rule only adds the demotion policy:
+
+```yaml
+keys:
+  meridian:
+    objective: premium
+    demote_at: 0.004            # fraction of the caller's most-saturated limit
+    demote_to: best-effort      # optional; defaults to "best-effort"
+```
+
+Below `demote_at` the caller runs at its configured objective. Past it,
+requests are stamped `demote_to` instead -- still admitted, at lower priority,
+with backpressure left to llm-d's flow control, which is where it belongs: the
+gateway knows its queue depth, the proxy doesn't. The limiter's own hard 429
+at 100% remains the backstop, so `demote_at` carves a soft band underneath it
+(realistic values are 0.5-0.9; the POC uses 0.004 = 4 of 1000 tokens so three
+requests cross it). The computed saturation is also forwarded as
+`x-litellm-ratelimit-saturation`, so downstream logic can make its own calls.
+
+How the read works, cheapest path first:
+
+- If the limiter's pre-call already ran for this request, its
+  `RateLimitResponse` sits on a ContextVar stash
+  (`get_request_stash_for_call`) -- read back with zero cache traffic.
+- Otherwise the hook builds the same descriptors the limiter would
+  (`_create_rate_limit_descriptors`) and calls
+  `should_rate_limit(read_only=True)`: the in-memory tier of the limiter's
+  internal `DualCache` answers first (every enforced request writes Redis
+  results back into it), Redis fills the gaps. Slightly stale cross-instance,
+  which is fine for a priority decision.
+
+In practice the second path is the one taken -- config callbacks register
+before the built-in proxy hooks, so this hook runs first -- and that ordering
+is the *better* one: it reads **settled** usage only. The limiter's own
+numbers (and the `x-ratelimit-*` headers) include the current request's
+in-flight token reservation (~hundreds of tokens even for a one-word prompt),
+which would make the saturation signal jumpy.
+
+Every failure mode of the read degrades to "no saturation signal, keep the
+configured objective" -- never to a failed request.
+
 The file is re-read when its mtime changes, so a remap takes effect without
 restarting the proxy. A malformed edit is logged and the last good mapping is
 kept, rather than failing every request.
@@ -121,6 +174,23 @@ Only the two edges. The hook and the mapping are unchanged:
 - **The proxy has to be the only route to the gateway.** Everything here is
   worthless if a caller can reach the inference gateway directly -- that still
   needs a NetworkPolicy or gateway-level auth.
-- **Static mapping only.** No per-key overrides at request time, no time-of-day
-  or queue-depth-aware demotion, no spend-based downgrade. The hook is the place
-  those would go; the mapping lookup is one function.
+- **The saturation read leans on private LiteLLM APIs.** `should_rate_limit`,
+  `_create_rate_limit_descriptors` and the request stash are internals of the
+  v3 limiter, verified against litellm 1.99.0. An upgrade can break the read;
+  when it does, the hook logs a warning and keeps injecting the configured
+  objective -- demotion silently stops until the call sites are re-checked.
+- **Demotion needs limits to exist.** No `tpm_limit`/`rpm_limit` on the key,
+  user or team means no descriptors, no counters, no saturation signal. And
+  because the v3 limiter still enforces the hard 429 at 100%, `demote_at`
+  must be below 1.0 to buy any soft band at all.
+- **Saturation is per LiteLLM identity, not per rule.** The counters belong to
+  the key/user/team that carries the limit. A team-wide grant is a
+  `team_tpm_limit`; a `demote_at` on a `teams:` rule then demotes members off
+  the shared team counter.
+- **Demotion needs the demoted objective to exist too.** `demote_to` values
+  are `InferenceObjective` names like any other; the EPP decides what an
+  unresolvable one means.
+- **Still no queue-depth awareness on the proxy side.** Demotion is
+  quota-driven; llm-d's flow control supplies the load-aware part inside each
+  band. Anything fancier (time-of-day, spend-based) slots into the same
+  decision point in `async_pre_call_hook`.
