@@ -29,3 +29,17 @@ keys:
 
   lightwell:
     objective: standard
+
+  # Soft token limits: meridian runs premium until the window's token budget is
+  # spent, then requests are demoted to `demote_to` (not rejected) until the
+  # window rolls over. The budget belongs to the matched rule, so a `teams:`
+  # rule with `limits:` gives the whole team one shared budget.
+  #
+  # tokens_per_minute is tiny so the POC can spend it in two requests (the mock
+  # bills 2 tokens per call); real values would be thousands/millions.
+  meridian:
+    objective: premium
+    limits:
+      tokens_per_minute: 3
+      tokens_per_hour: 100000
+      demote_to: best-effort

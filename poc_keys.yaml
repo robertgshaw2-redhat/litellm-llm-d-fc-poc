@@ -12,3 +12,8 @@ lightwell-key:
   key_alias: lightwell
   user_id: ci@example.com
   team_id: team-batch-eval
+
+meridian-key:
+  key_alias: meridian
+  user_id: batch@example.com
+  team_id: team-batch-eval

@@ -14,12 +14,21 @@ So this hook does two things on every request:
 
 Precedence is most-specific-first: key alias, then user, then team, then the
 default. See objectives.yaml for the mapping itself.
+
+A rule may also carry soft token limits (`limits:`). Those are not LiteLLM's
+tpm/rpm limits -- exceeding them never returns a 429. Instead, actual token
+usage is charged against per-window counters after each response, and once a
+window's budget is spent, subsequent requests are *demoted*: they still go
+through, but stamped with a lower objective (`demote_to`, default
+"best-effort") until the window rolls over. Counters live in the proxy's
+DualCache, so with a Redis cache configured they are shared across workers.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +47,16 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / "objectives.yaml"
 # `api_key` is the salted hash of the virtual key, not the key itself.
 IDENTITY_FIELDS = ("key_alias", "user_id", "team_id", "end_user_id", "api_key")
 
+# Soft limit windows: (field under `limits:`, strftime window label, counter TTL).
+# Fixed windows keyed by wall-clock label, same scheme as LiteLLM's own
+# parallel request limiter; the TTL only garbage-collects dead windows.
+LIMIT_WINDOWS = (
+    ("tokens_per_minute", "%Y-%m-%dT%H:%M", 2 * 60),
+    ("tokens_per_hour", "%Y-%m-%dT%H", 2 * 3600),
+)
+DEFAULT_DEMOTE_OBJECTIVE = "best-effort"
+CACHE_PREFIX = "llmd-flow-control"
+
 
 class FlowControlHook(CustomLogger):
     def __init__(self, config_path: str | Path | None = None) -> None:
@@ -47,6 +66,9 @@ class FlowControlHook(CustomLogger):
         )
         self._config: dict[str, Any] = {}
         self._mtime: float | None = None
+        # The proxy's DualCache, captured in async_pre_call_hook: the post-call
+        # hook that charges usage is not handed a cache reference by LiteLLM.
+        self._cache: Any = None
         self._reload_if_changed()
 
     # ---------------------------------------------------------------- config
@@ -145,6 +167,77 @@ class FlowControlHook(CustomLogger):
                 return str(value)
         return None
 
+    # ---------------------------------------------------------- soft limits
+
+    @staticmethod
+    def _window_key(bucket: str, label: str) -> str:
+        return f"{CACHE_PREFIX}::{bucket}::{label}::tokens"
+
+    async def _spent_window(
+        self, cache: Any, bucket: str, limits: dict[str, Any]
+    ) -> tuple[str, float, float] | None:
+        """Return (window, used, limit) for the first exhausted window, else None.
+
+        The bucket is the *matched rule* (e.g. "teams:team-a"), so every caller
+        sharing that rule draws from one budget -- a group grant, not per-key.
+        """
+        now = time.gmtime()
+        for field, fmt, _ttl in LIMIT_WINDOWS:
+            limit = limits.get(field)
+            if not limit:
+                continue
+            used = await cache.async_get_cache(self._window_key(bucket, time.strftime(fmt, now)))
+            if used is not None and float(used) >= float(limit):
+                return field, float(used), float(limit)
+        return None
+
+    def _demote_objective(self, limits: dict[str, Any]) -> str:
+        return str(
+            limits.get("demote_to")
+            or self.defaults.get("demote_objective")
+            or DEFAULT_DEMOTE_OBJECTIVE
+        )
+
+    async def async_post_call_success_hook(
+        self,
+        data: dict,
+        user_api_key_dict: UserAPIKeyAuth,
+        response: Any,
+    ) -> None:
+        """Charge actual token usage against the matched rule's limit windows.
+
+        Counting happens after the response, so a burst can overshoot a window
+        by however much was already in flight -- acceptable for tiering, this
+        is not a billing meter. Streaming responses do not pass through this
+        hook; a production version would also count them via the logging
+        callback's completed-stream event.
+        """
+        cache = self._cache
+        if cache is None or not self._applies_to_model(data.get("model")):
+            return None
+        rule, why = self._lookup(user_api_key_dict)
+        limits = rule.get("limits") or {}
+        if not any(limits.get(field) for field, _fmt, _ttl in LIMIT_WINDOWS):
+            return None
+
+        usage = getattr(response, "usage", None)
+        if usage is None and isinstance(response, dict):
+            usage = response.get("usage")
+        total = usage.get("total_tokens") if isinstance(usage, dict) else getattr(usage, "total_tokens", None)
+        if not total:
+            return None
+
+        now = time.gmtime()
+        for field, fmt, ttl in LIMIT_WINDOWS:
+            if not limits.get(field):
+                continue
+            await cache.async_increment_cache(
+                key=self._window_key(why, time.strftime(fmt, now)),
+                value=float(total),
+                ttl=ttl,
+            )
+        return None
+
     # --------------------------------------------------------------- headers
 
     @staticmethod
@@ -191,6 +284,22 @@ class FlowControlHook(CustomLogger):
         if not objective:
             verbose_proxy_logger.debug("flow_control: no objective for %s (%s)", model, why)
             return data
+
+        limits = rule.get("limits") or {}
+        if limits:
+            self._cache = cache
+            spent = await self._spent_window(cache, why, limits)
+            if spent:
+                window, used, limit = spent
+                objective = self._demote_objective(limits)
+                verbose_proxy_logger.info(
+                    "flow_control: %s over %s (%.0f/%.0f tokens) -> demoted to %s",
+                    why,
+                    window,
+                    used,
+                    limit,
+                    objective,
+                )
 
         injected = {OBJECTIVE_HEADER: str(objective)}
         fairness_id = self._fairness_id(rule, user_api_key_dict)

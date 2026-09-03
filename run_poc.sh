@@ -113,6 +113,16 @@ run_case "spoof stripped" lightwell-key standard lightwell \
   -H "x-llm-d-inference-objective: premium" \
   -H "x-llm-d-inference-fairness-id: forge"
 
+# soft limit: meridian is premium with tokens_per_minute: 3. The mock bills 2
+# tokens per request and usage is charged after the response, so requests run
+# premium at 0 and 2 tokens spent, and the third (4 >= 3) is demoted to
+# best-effort -- still admitted, not 429'd. The counter windows are keyed by
+# wall-clock minute, so make sure all three requests land in the same one.
+if (( $(date +%-S) > 54 )); then sleep 6; fi
+run_case "soft limit: 1st premium" meridian-key premium meridian
+run_case "soft limit: 2nd premium" meridian-key premium meridian
+run_case "soft limit: demoted" meridian-key best-effort meridian
+
 echo
 if [[ $failures -eq 0 ]]; then
   echo "all cases passed"

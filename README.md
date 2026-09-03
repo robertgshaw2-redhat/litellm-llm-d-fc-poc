@@ -8,8 +8,11 @@ llm-d's flow control admits requests by reading two headers at the EPP:
 | `x-llm-d-inference-fairness-id` | the flow id used for fair sharing *within* that band |
 
 In LiteLLM, a pre-call hook:
-1. **strips** `x-llm-d-*` flow control headers off whatever the client sent, and
-2. **injects** them from a static mapping of LiteLLM identity -> objective.
+1. **strips** `x-llm-d-*` flow control headers off whatever the client sent,
+2. **injects** them from a mapping of LiteLLM identity -> objective, and
+3. **demotes** callers who have spent their soft token budget to a lower band
+   (see [Soft limits](#soft-limits-demote-dont-429)) -- traffic keeps flowing,
+   just at lower priority, instead of a 429.
 
 ## Layout
 
@@ -39,6 +42,9 @@ First run builds `./.venv` (~1 min); after that it takes a few seconds.
 PASS key rule: forge            premium            forge
 PASS key rule: lightwell        standard           lightwell
 PASS spoof stripped             standard           lightwell
+PASS soft limit: 1st premium    premium            meridian
+PASS soft limit: 2nd premium    premium            meridian
+PASS soft limit: demoted        best-effort        meridian
 
 all cases passed
 ```
@@ -91,6 +97,49 @@ band:
 `models:` at the top of the file scopes injection to the llm-d-backed model
 groups, so anything else behind the same proxy is left alone.
 
+## Soft limits: demote, don't 429
+
+A rule can grant a token budget per window and name the band to fall back to
+when it is spent:
+
+```yaml
+teams:
+  team-a:
+    objective: premium
+    limits:
+      tokens_per_minute: 20000
+      tokens_per_hour: 500000
+      demote_to: best-effort      # optional; defaults to "best-effort"
+```
+
+These are deliberately **not** LiteLLM's `tpm_limit`/`rpm_limit`: those are
+hard limits enforced by the built-in parallel request limiter, and exceeding
+them rejects the request with a 429. Here the request is always admitted --
+what changes is the priority band it is admitted *under*. Inside the budget
+the caller runs at its configured objective; once a window's tokens are spent,
+requests are stamped with `demote_to` instead, until the window rolls over.
+Backpressure then comes from llm-d's own flow control, which is where it
+belongs: the gateway knows its queue depth, the proxy doesn't.
+
+Mechanics, all inside the same hook:
+
+- After each response, `async_post_call_success_hook` charges the response's
+  actual `usage.total_tokens` against one counter per configured window.
+- Counters are keyed by the **matched rule** (`teams:team-a`), not the caller,
+  so everyone sharing a rule draws from one budget -- a group grant. Fairness
+  ids are unaffected: inside whatever band the group lands in, per-key fair
+  sharing still applies.
+- Counters live in the proxy's `DualCache` (the same cache LiteLLM's own rate
+  limiter uses): in-memory for a single worker, shared via Redis when the
+  proxy is configured with one.
+- Windows are fixed wall-clock windows (minute / hour), the same scheme as
+  LiteLLM's v1 limiter. TTLs garbage-collect old windows.
+
+The POC's `meridian` key runs this live: `tokens_per_minute: 3` against a mock
+that bills 2 tokens per request, so the third request in a minute goes out
+demoted -- the gateway itself saw `best-effort` -- and the first request of the
+next minute is premium again.
+
 The file is re-read when its mtime changes, so a remap takes effect without
 restarting the proxy. A malformed edit is logged and the last good mapping is
 kept, rather than failing every request.
@@ -121,6 +170,18 @@ Only the two edges. The hook and the mapping are unchanged:
 - **The proxy has to be the only route to the gateway.** Everything here is
   worthless if a caller can reach the inference gateway directly -- that still
   needs a NetworkPolicy or gateway-level auth.
-- **Static mapping only.** No per-key overrides at request time, no time-of-day
-  or queue-depth-aware demotion, no spend-based downgrade. The hook is the place
-  those would go; the mapping lookup is one function.
+- **Soft-limit accounting is post-paid.** Usage is charged after the response,
+  so a burst of concurrent requests can overshoot a window by whatever was in
+  flight when it filled. Fine for tiering; this is not a billing meter. For a
+  pre-paid variant, reserve an estimate in the pre-call hook and reconcile
+  after, which is what LiteLLM's own v3 limiter does.
+- **Streaming responses are not counted.** `async_post_call_success_hook` only
+  sees non-streaming responses. A production version would also charge usage
+  from the logging callback's completed-stream event
+  (`async_log_success_event`), which carries final usage for streams.
+- **Demotion needs the demoted objective to exist too.** `demote_to` values
+  are `InferenceObjective` names like any other; the EPP decides what an
+  unresolvable one means.
+- **Still no queue-depth awareness.** Demotion here is quota-driven. Time-of-day
+  or saturation-aware logic slots into the same `_spent_window` decision point;
+  the mapping lookup is one function.
