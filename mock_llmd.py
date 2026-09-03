@@ -27,7 +27,7 @@ async def models() -> dict:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> dict:
     body = await request.json()
-    seen = {k.lower(): v for k, v in request.headers.items() if k.lower().startswith("x-llm-d-")}
+    seen = {k.lower(): v for k, v in request.headers.items() if k.lower().startswith(("x-llm-d-", "x-litellm-"))}
     return {
         "id": "chatcmpl-mock",
         "object": "chat.completion",

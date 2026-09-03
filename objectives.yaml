@@ -30,16 +30,16 @@ keys:
   lightwell:
     objective: standard
 
-  # Soft token limits: meridian runs premium until the window's token budget is
-  # spent, then requests are demoted to `demote_to` (not rejected) until the
-  # window rolls over. The budget belongs to the matched rule, so a `teams:`
-  # rule with `limits:` gives the whole team one shared budget.
+  # Saturation-based demotion, driven by LiteLLM's own v3 rate limiter
+  # counters (the numbers behind the x-ratelimit-* response headers), not by
+  # anything this hook tracks itself. meridian's key has tpm_limit: 1000
+  # (poc_keys.yaml); once the most-saturated of its limits crosses demote_at,
+  # requests are stamped `demote_to` instead of premium -- still admitted.
+  # The limiter's own hard 429 at 100% remains the backstop.
   #
-  # tokens_per_minute is tiny so the POC can spend it in two requests (the mock
-  # bills 2 tokens per call); real values would be thousands/millions.
+  # demote_at is tiny (0.4% = 4 of 1000 tokens) so the POC crosses it in two
+  # requests; real values would be 0.5-0.9.
   meridian:
     objective: premium
-    limits:
-      tokens_per_minute: 3
-      tokens_per_hour: 100000
-      demote_to: best-effort
+    demote_at: 0.004
+    demote_to: best-effort

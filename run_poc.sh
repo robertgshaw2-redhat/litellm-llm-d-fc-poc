@@ -113,15 +113,14 @@ run_case "spoof stripped" lightwell-key standard lightwell \
   -H "x-llm-d-inference-objective: premium" \
   -H "x-llm-d-inference-fairness-id: forge"
 
-# soft limit: meridian is premium with tokens_per_minute: 3. The mock bills 2
-# tokens per request and usage is charged after the response, so requests run
-# premium at 0 and 2 tokens spent, and the third (4 >= 3) is demoted to
-# best-effort -- still admitted, not 429'd. The counter windows are keyed by
-# wall-clock minute, so make sure all three requests land in the same one.
-if (( $(date +%-S) > 54 )); then sleep 6; fi
-run_case "soft limit: 1st premium" meridian-key premium meridian
-run_case "soft limit: 2nd premium" meridian-key premium meridian
-run_case "soft limit: demoted" meridian-key best-effort meridian
+# saturation demotion: meridian's key has a real LiteLLM tpm_limit (1000) and
+# the hook reads the v3 rate limiter's own counters. The mock bills 2 tokens
+# per request, so saturation runs 0.0000, 0.0020, 0.0040 -- and the third
+# request crosses demote_at: 0.004 and goes out best-effort, still admitted.
+# All three land inside one 60s limiter window (requests take well under that).
+run_case "saturation: 1st premium" meridian-key premium meridian
+run_case "saturation: 2nd premium" meridian-key premium meridian
+run_case "saturation: demoted" meridian-key best-effort meridian
 
 echo
 if [[ $failures -eq 0 ]]; then
