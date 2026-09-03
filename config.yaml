@@ -1,0 +1,24 @@
+# LiteLLM proxy in front of a mock llm-d gateway, with flow control headers
+# injected per key.
+#
+# Identity comes from poc_keys.yaml via a custom_auth function (so no database
+# is needed), and the upstream is mock_llmd.py, which echoes back the headers it
+# received.
+
+model_list:
+  - model_name: gemma-4
+    litellm_params:
+      model: openai/RedHatAI/gemma-4-12B-it-FP8-Dynamic
+      api_base: http://127.0.0.1:8080/v1
+      api_key: none
+
+litellm_settings:
+  callbacks: hooks.flow_control.flow_control_hook
+
+general_settings:
+  master_key: sk-cb-master
+  custom_auth: static_auth.user_api_key_auth
+
+  # Deliberately ON, to prove the hook still wins: with forwarding on, a
+  # client's own x-llm-d-* headers would otherwise reach the backend.
+  forward_client_headers_to_llm_api: true

@@ -1,0 +1,31 @@
+# Static mapping: LiteLLM identity -> llm-d flow control objective.
+#
+# Read by hooks/flow_control.py on every request (re-read when the file's mtime
+# changes, so an edit takes effect without restarting the proxy).
+#
+# Precedence, most specific first:   keys > users > teams > defaults
+#
+# This POC uses only the `keys` tier; `users:` and `teams:` are supported by the
+# hook and slot in here the same way, keyed by LiteLLM `user_id` / `team_id`.
+#
+# The values under `objective` must match the name of an InferenceObjective in
+# the model's namespace -- llm-d rejects (or, depending on EPP config, defaults)
+# an objective it cannot resolve.
+
+# Only inject the headers for model groups actually served by llm-d. Anything
+# else routed through this proxy (a hosted API, an embedding endpoint) is left
+# untouched, since providers reject unknown headers.
+models:
+  - "gemma-4*"
+
+defaults:
+  objective: standard
+  fairness_id_from: key_alias
+
+# Keyed by the virtual key's alias (`key_alias`), not the key itself.
+keys:
+  forge:
+    objective: premium
+
+  lightwell:
+    objective: standard

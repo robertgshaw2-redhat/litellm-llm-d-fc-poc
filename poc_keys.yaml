@@ -1,0 +1,14 @@
+# POC ONLY. Fake API keys -> the identity LiteLLM would otherwise get from a
+# virtual key row in its database. Nothing here is a credential; it exists so
+# the POC can run without Postgres. In a real deployment these come from
+# `litellm keys create --key-alias ... --team-id ...` and this file goes away.
+
+forge-key:
+  key_alias: forge
+  user_id: alice@example.com
+  team_id: team-platform
+
+lightwell-key:
+  key_alias: lightwell
+  user_id: ci@example.com
+  team_id: team-batch-eval
