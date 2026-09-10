@@ -50,6 +50,8 @@ PASS key policy: atlas            gemma-4      premium        atlas
 PASS token x model: atlas         gemma-4-mini standard       atlas
 PASS team policy: nomad           gemma-4      standard       nomad
 PASS team x model: nomad          gemma-4-mini best-effort    nomad
+PASS team default: demoted        gemma-4      best-effort    nomad
+PASS team default: per key        gemma-4      standard       ember
 PASS saturation: 1st premium      gemma-4      premium        meridian
 PASS saturation: 2nd premium      gemma-4      premium        meridian
 PASS saturation: demoted          gemma-4      standard       meridian
@@ -111,6 +113,9 @@ teams:
     models:                 # team x model override, same shape
       "gemma-4-mini": best-effort
 ```
+
+A team rule may also set `key_defaults:` -- see
+[Per-key defaults from the team](#per-key-defaults-from-the-team).
 
 Resolution is most specific first: **key alias -> user -> team -> default**
 (the first tier with a rule wins; `users:` is keyed by LiteLLM `user_id`,
@@ -203,6 +208,42 @@ counters feed the decision. Valid `demote_on` values are the limiter's
 descriptor keys: `api_key`, `user`, `team`, `team_member`, `end_user`,
 `model_per_key`, `model_per_team`.
 
+### Per-key defaults from the team
+
+Demotion needs limits on the caller, and setting them on every key is toil.
+LiteLLM's own team-level knob doesn't help here: `team_tpm_limit` is **one
+counter shared by the whole team**, so one noisy key drags everyone past
+`demote_at`. A team rule's `key_defaults:` instead gives every member key its
+**own** limits without per-key configuration:
+
+```yaml
+teams:
+  team-photon:
+    policy: async
+    key_defaults:
+      tpm_limit: 1000       # each member key gets its own 1000 TPM
+```
+
+Any limit the key row already carries wins -- these are defaults, not caps.
+Supported fields: `tpm_limit`, `rpm_limit`, `max_parallel_requests`, and the
+per-model `model_tpm_limit` / `model_rpm_limit` (so a team can default
+per-key-per-model limits too, feeding the `demote_on: [model_per_key]`
+scoping above).
+
+Mechanically, the hook fills the missing fields in on the request's
+`UserAPIKeyAuth` before LiteLLM's built-in hooks run; the v3 limiter then
+enforces and tracks them exactly as if the key row carried them -- hard 429 at
+100%, `x-ratelimit-*` headers, and the saturation counters demotion reads.
+The defaults are applied on every request through the proxy, not just
+llm-d-routed models, so accounting stays uniform. The `team default:` rows in
+the POC output show two limitless keys on the same team demoting
+independently: `nomad` crosses its own counter and degrades to best-effort
+while `ember` still runs standard.
+
+`key_defaults` applies to the team's keys whichever tier wins the *policy*
+resolution -- limits and policies are orthogonal; a key with its own `keys:`
+policy rule still inherits its team's default limits.
+
 How the read works, cheapest path first:
 
 - If the limiter's pre-call already ran for this request, its
@@ -267,10 +308,18 @@ Only the two edges. The hook and the mapping are unchanged:
   objective -- demotion silently stops until the call sites are re-checked.
 - **Demotion needs limits to exist.** No `tpm_limit`/`rpm_limit` (or their
   per-model `model_tpm_limit`/`model_rpm_limit` variants) on the key, user or
-  team means no descriptors, no counters, no saturation signal -- and a
-  `demote_on` scope that matches none of the caller's limits is the same as
-  no signal. Because the v3 limiter still enforces the hard 429 at 100%,
-  `demote_at` must be below 1.0 to buy any soft band at all.
+  team -- and none defaulted in by the team's `key_defaults:` -- means no
+  descriptors, no counters, no saturation signal. A `demote_on` scope that
+  matches none of the caller's limits is the same as no signal. Because the
+  v3 limiter still enforces the hard 429 at 100%, `demote_at` must be below
+  1.0 to buy any soft band at all.
+- **`key_defaults` rides on hook ordering.** It mutates the request's
+  `UserAPIKeyAuth` and counts on config callbacks running before LiteLLM's
+  built-in hooks (they do; the POC's `team default:` cases prove it end to
+  end, since demotion only fires if the limiter tracked the defaulted limit).
+  If a LiteLLM upgrade flips that ordering, the defaults stop being enforced
+  -- keys with no limits of their own just lose the saturation signal and the
+  429 backstop, they don't fail.
 - **Saturation is per LiteLLM identity, not per rule.** The counters belong to
   the key/user/team (or key x model / team x model) that carries the limit. A
   team-wide grant is a `team_tpm_limit`; a `demote_at` on a `teams:` rule then

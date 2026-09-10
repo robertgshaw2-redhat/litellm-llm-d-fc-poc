@@ -126,6 +126,15 @@ run_case "token x model: atlas" atlas-key gemma-4-mini standard atlas
 run_case "team policy: nomad" nomad-key gemma-4 standard nomad
 run_case "team x model: nomad" nomad-key gemma-4-mini best-effort nomad
 
+# team key_defaults: neither nomad nor ember carries a limit of its own --
+# team-photon's `key_defaults: {tpm_limit: 1000}` gives each key its OWN
+# per-key counter (unlike a shared team_tpm_limit). The two requests above
+# put nomad at 4 of 1000 tokens, so this one crosses the async policy's
+# demote_at (0.004) and degrades to best-effort -- while ember, same team,
+# same defaults, fresh counter, still runs standard.
+run_case "team default: demoted" nomad-key gemma-4 best-effort nomad
+run_case "team default: per key" ember-key gemma-4 standard ember
+
 # saturation demotion: meridian's key has a real LiteLLM tpm_limit (1000) and
 # the hook reads the v3 rate limiter's own counters. The mock bills 2 tokens
 # per request, so saturation runs 0.0000, 0.0020, 0.0040 -- and the third

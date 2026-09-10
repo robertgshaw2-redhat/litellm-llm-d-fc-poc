@@ -30,6 +30,12 @@ limits count (e.g. only the per-model ones), so demotion on one model does not
 bleed into another. The hard 429 at 100% stays, as the limiter still enforces
 it; `demote_at` carves a soft band underneath it. No counters of our own: with
 Redis configured on the proxy, saturation is cluster-wide for free.
+
+A team rule may also carry `key_defaults:` -- LiteLLM limits (tpm_limit,
+rpm_limit, max_parallel_requests, model_tpm_limit, model_rpm_limit) applied to
+any member key that doesn't set its own, so every key on a team gets its own
+per-key limit without per-key configuration. The v3 limiter enforces and
+tracks them as if the key row carried them.
 """
 
 from __future__ import annotations
@@ -67,6 +73,12 @@ POLICY_FIELDS = (
     "fairness_id",
     "fairness_id_from",
 )
+
+# LiteLLM limits a team rule's `key_defaults:` may supply for member keys that
+# don't carry their own. The first three are UserAPIKeyAuth fields, the last
+# two live in key metadata (that's where the v3 limiter reads them from).
+KEY_DEFAULT_FIELDS = ("tpm_limit", "rpm_limit", "max_parallel_requests")
+KEY_DEFAULT_METADATA_FIELDS = ("model_tpm_limit", "model_rpm_limit")
 
 
 class FlowControlHook(CustomLogger):
@@ -225,6 +237,55 @@ class FlowControlHook(CustomLogger):
             break
         return effective, why
 
+    def _apply_team_key_defaults(self, user_api_key_dict: UserAPIKeyAuth) -> None:
+        """Default LiteLLM limits onto a key from its team's `key_defaults:`.
+
+        A team-wide `team_tpm_limit` is one counter shared by the whole team;
+        `key_defaults:` instead gives every member key its *own* limit without
+        configuring each key. A limit the key already carries always wins --
+        these are defaults, not caps.
+
+        This works because config callbacks run before LiteLLM's built-in
+        hooks: the fields are set here, then the v3 limiter's pre-call reads
+        them off the same UserAPIKeyAuth and enforces + tracks them exactly as
+        if the key row carried them. Applied to every request through the
+        proxy (not just llm-d-routed models), so accounting stays uniform.
+        """
+        team_id = getattr(user_api_key_dict, "team_id", None)
+        if not team_id:
+            return
+        rule = (self._config.get("teams") or {}).get(team_id) or {}
+        defaults = rule.get("key_defaults")
+        if not isinstance(defaults, dict):
+            return
+
+        applied = []
+        for field in KEY_DEFAULT_FIELDS:
+            if defaults.get(field) is None:
+                continue
+            if getattr(user_api_key_dict, field, None) is None:
+                setattr(user_api_key_dict, field, defaults[field])
+                applied.append(field)
+
+        meta_defaults = {
+            f: defaults[f] for f in KEY_DEFAULT_METADATA_FIELDS if defaults.get(f) is not None
+        }
+        if meta_defaults:
+            metadata = user_api_key_dict.metadata or {}
+            for field, value in meta_defaults.items():
+                if not metadata.get(field):
+                    metadata[field] = value
+                    applied.append(field)
+            user_api_key_dict.metadata = metadata
+
+        if applied:
+            verbose_proxy_logger.debug(
+                "flow_control: applied team %s key_defaults to key_alias=%s: %s",
+                team_id,
+                user_api_key_dict.key_alias,
+                ", ".join(applied),
+            )
+
     def _fairness_id(
         self, policy: dict[str, Any], user_api_key_dict: UserAPIKeyAuth
     ) -> str | None:
@@ -358,6 +419,11 @@ class FlowControlHook(CustomLogger):
         call_type: str,
     ) -> dict:
         self._reload_if_changed()
+
+        # Before anything else -- and before the built-in v3 limiter's own
+        # pre-call runs -- fill in LiteLLM limits from the team's key_defaults,
+        # so the limiter enforces and tracks them like key-native limits.
+        self._apply_team_key_defaults(user_api_key_dict)
 
         # Strip everywhere the inbound headers can reach the backend or the logs:
         # `headers` is what forward_client_headers_to_llm_api populates,

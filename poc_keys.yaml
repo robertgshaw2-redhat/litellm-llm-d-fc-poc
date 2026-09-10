@@ -29,10 +29,18 @@ atlas-key:
   user_id: dev@example.com
   team_id: team-platform
 
-# No key rule in objectives.yaml -- picks up its team's policy (team-photon).
+# No key rule in objectives.yaml -- picks up its team's policy (team-photon),
+# and its per-key tpm_limit from the team's key_defaults (no limit here).
 nomad-key:
   key_alias: nomad
   user_id: crawler@example.com
+  team_id: team-photon
+
+# Second limitless key on team-photon: gets the same key_defaults, but its own
+# counter -- nomad saturating does not demote ember.
+ember-key:
+  key_alias: ember
+  user_id: indexer@example.com
   team_id: team-photon
 
 # Per-model enforcement: a key-wide tpm_limit AND a per-model tpm limit on

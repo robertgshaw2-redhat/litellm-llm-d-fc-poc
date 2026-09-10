@@ -96,7 +96,16 @@ teams:
   # team policy + team x model override: any key in team-photon without its
   # own key rule runs async, and drops to the scavenger class on the batch
   # model.
+  #
+  # key_defaults gives every member key its OWN LiteLLM limits without
+  # configuring each key -- unlike a team_tpm_limit, which is one counter
+  # shared by the whole team. A limit the key already carries wins. Supported:
+  # tpm_limit, rpm_limit, max_parallel_requests, model_tpm_limit,
+  # model_rpm_limit. With the async policy's demote_at, each key in the team
+  # degrades to best-effort on its own saturation, independently.
   team-photon:
     policy: async
+    key_defaults:
+      tpm_limit: 1000
     models:
       "gemma-4-mini": best-effort
