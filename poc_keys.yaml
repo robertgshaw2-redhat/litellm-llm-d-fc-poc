@@ -19,5 +19,38 @@ meridian-key:
   team_id: team-batch-eval
   # A real LiteLLM key limit (`litellm keys create ... --tpm-limit`): the v3
   # parallel request limiter tracks + enforces it (429 at 100%), and the flow
-  # control hook reads the same counters to demote at `demote_at` before that.
+  # control hook reads the same counters to demote at the policy's `demote_at`
+  # before that.
   tpm_limit: 1000
+
+# token x model override: same policy machinery, no limits needed.
+atlas-key:
+  key_alias: atlas
+  user_id: dev@example.com
+  team_id: team-platform
+
+# No key rule in objectives.yaml -- picks up its team's policy (team-photon).
+nomad-key:
+  key_alias: nomad
+  user_id: crawler@example.com
+  team_id: team-photon
+
+# Per-model enforcement: a key-wide tpm_limit AND a per-model tpm limit on
+# gemma-4 only. model_tpm_limit in key metadata is real LiteLLM
+# (`litellm keys create ... --metadata '{"model_tpm_limit": {...}}'`); the v3
+# limiter turns it into a model_per_key counter scoped to key x model. The
+# `harbor` policy in objectives.yaml demotes on that counter alone.
+harbor-key:
+  key_alias: harbor
+  user_id: pipeline@example.com
+  team_id: team-platform
+  tpm_limit: 1000
+  metadata:
+    model_tpm_limit:
+      gemma-4: 1000
+
+# No rule anywhere -- exercises `defaults.policy`.
+drift-key:
+  key_alias: drift
+  user_id: newhire@example.com
+  team_id: team-platform

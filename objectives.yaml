@@ -1,16 +1,23 @@
-# Static mapping: LiteLLM identity -> llm-d flow control objective.
+# Static mapping: LiteLLM identity -> llm-d flow control policy.
 #
 # Read by hooks/flow_control.py on every request (re-read when the file's mtime
 # changes, so an edit takes effect without restarting the proxy).
 #
+# `policies:` defines named policies -- an objective plus an optional
+# saturation-demotion rule. `keys:` / `users:` / `teams:` assign one per
+# identity, and may override it per model via a `models:` map, so the same
+# token runs one policy on its interactive model and another on its batch
+# model.
+#
 # Precedence, most specific first:   keys > users > teams > defaults
+# and within the matched tier:       models: override > the tier's policy
 #
-# This POC uses only the `keys` tier; `users:` and `teams:` are supported by the
-# hook and slot in here the same way, keyed by LiteLLM `user_id` / `team_id`.
+# This POC exercises `keys` and `teams`; `users:` slots in the same way, keyed
+# by LiteLLM `user_id`.
 #
-# The values under `objective` must match the name of an InferenceObjective in
-# the model's namespace -- llm-d rejects (or, depending on EPP config, defaults)
-# an objective it cannot resolve.
+# The values under `objective` / `demote_to` must match the name of an
+# InferenceObjective in the model's namespace -- llm-d rejects (or, depending
+# on EPP config, defaults) an objective it cannot resolve.
 
 # Only inject the headers for model groups actually served by llm-d. Anything
 # else routed through this proxy (a hosted API, an embedding endpoint) is left
@@ -18,28 +25,78 @@
 models:
   - "gemma-4*"
 
+# Named policies. demote_at is a fraction of the caller's most-saturated
+# LiteLLM rate limit (tpm_limit / rpm_limit on the key, user or team --
+# including the per-model model_tpm_limit / model_rpm_limit variants); past
+# it, requests are stamped demote_to instead of the objective, still admitted.
+# demote_at values here are tiny (0.4% = 4 of 1000 tokens) so the POC crosses
+# them in two requests; realistic values are 0.5-0.9.
+#
+# demote_on (optional) restricts which limits feed the saturation signal, by
+# the v3 limiter's descriptor keys: api_key, user, team, team_member,
+# end_user, model_per_key, model_per_team. Omitted = all of them.
+policies:
+  # Interactive traffic: premium band, degrade to standard when the caller
+  # closes in on its rate limit rather than 429ing them.
+  default:
+    objective: premium
+    demote_at: 0.004
+    demote_to: standard
+
+  # Async / batch traffic: standard band, degrade to best-effort near the limit.
+  async:
+    objective: standard
+    demote_at: 0.004
+    demote_to: best-effort
+
+  # Scavenger class: always the lowest band, nothing to demote to.
+  best-effort:
+    objective: best-effort
+
 defaults:
-  objective: standard
+  policy: default
   fairness_id_from: key_alias
 
 # Keyed by the virtual key's alias (`key_alias`), not the key itself.
 keys:
   forge:
-    objective: premium
+    policy: default
 
   lightwell:
-    objective: standard
+    policy: async
 
-  # Saturation-based demotion, driven by LiteLLM's own v3 rate limiter
-  # counters (the numbers behind the x-ratelimit-* response headers), not by
-  # anything this hook tracks itself. meridian's key has tpm_limit: 1000
-  # (poc_keys.yaml); once the most-saturated of its limits crosses demote_at,
-  # requests are stamped `demote_to` instead of premium -- still admitted.
-  # The limiter's own hard 429 at 100% remains the backstop.
-  #
-  # demote_at is tiny (0.4% = 4 of 1000 tokens) so the POC crosses it in two
-  # requests; real values would be 0.5-0.9.
+  # Saturation demotion, driven by LiteLLM's own v3 rate limiter counters (the
+  # numbers behind the x-ratelimit-* response headers), not by anything this
+  # hook tracks itself. meridian's key has tpm_limit: 1000 (poc_keys.yaml);
+  # once the most-saturated of its limits crosses the policy's demote_at,
+  # requests are stamped demote_to (standard) instead of premium -- still
+  # admitted. The limiter's own hard 429 at 100% remains the backstop.
   meridian:
-    objective: premium
-    demote_at: 0.004
-    demote_to: best-effort
+    policy: default
+
+  # token x model override: premium interactively, async on the batch model.
+  # The value is a policy name (or an inline policy mapping); patterns are
+  # fnmatch globs, first match wins.
+  atlas:
+    policy: default
+    models:
+      "gemma-4-mini": async
+
+  # Per-model enforcement: harbor's key carries both a key-wide tpm_limit and
+  # a per-model model_tpm_limit on gemma-4 (poc_keys.yaml). demote_on scopes
+  # the saturation signal to the per-model counters only, so saturating
+  # gemma-4 demotes harbor on gemma-4 while gemma-4-mini stays premium --
+  # without the scoping, the key-wide counter would demote both.
+  # (inline fields override the named policy's, field by field)
+  harbor:
+    policy: default
+    demote_on: [model_per_key]
+
+teams:
+  # team policy + team x model override: any key in team-photon without its
+  # own key rule runs async, and drops to the scavenger class on the batch
+  # model.
+  team-photon:
+    policy: async
+    models:
+      "gemma-4-mini": best-effort
