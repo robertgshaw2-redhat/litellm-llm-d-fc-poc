@@ -12,6 +12,14 @@ model_list:
       api_base: http://127.0.0.1:8080/v1
       api_key: none
 
+  # Second model group behind the same mock, for the per-model policy
+  # overrides and per-model rate limit cases.
+  - model_name: gemma-4-mini
+    litellm_params:
+      model: openai/RedHatAI/gemma-4-mini-4B-it-FP8-Dynamic
+      api_base: http://127.0.0.1:8080/v1
+      api_key: none
+
 litellm_settings:
   callbacks: hooks.flow_control.flow_control_hook
 

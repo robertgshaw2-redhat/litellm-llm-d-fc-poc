@@ -9,8 +9,11 @@ llm-d's flow control admits requests by reading two headers at the EPP:
 
 In LiteLLM, a pre-call hook:
 1. **strips** `x-llm-d-*` flow control headers off whatever the client sent,
-2. **injects** them from a mapping of LiteLLM identity -> objective, and
-3. **demotes** callers nearing their LiteLLM rate limits to a lower band
+2. **injects** them from a set of named **policies** (objective + demotion
+   rule) assigned per LiteLLM identity -- key, user or team -- with per-model
+   overrides for any of them, and
+3. **demotes** callers nearing their LiteLLM rate limits to the policy's
+   fallback band
    (see [Saturation demotion](#saturation-demotion-reusing-litellms-rate-limit-counters))
    -- traffic keeps flowing, just at lower priority, instead of a 429.
 
@@ -19,11 +22,11 @@ In LiteLLM, a pre-call hook:
 ```
 run_poc.sh            starts the mock gateway + proxy, asserts on headers
 config.yaml           proxy config, wired to the mock + static auth
-objectives.yaml       the mapping: key alias / user / team -> objective
+objectives.yaml       the policies + the mapping: key / user / team -> policy
 hooks/flow_control.py the pre-call hook (strip + inject)
 mock_llmd.py          stand-in gateway; echoes back the x-llm-d-* it received
 static_auth.py        POC-only custom_auth, so no Postgres is needed
-poc_keys.yaml         the two fake keys -> identity (never real credentials)
+poc_keys.yaml         the fake keys -> identity (never real credentials)
 ```
 
 ## Run it
@@ -37,14 +40,25 @@ Needs `uv` and `jq`.
 First run builds `./.venv` (~1 min); after that it takes a few seconds.
 
 ```
-     case                       objective          fairness-id
----- -------------------------- ------------------ ------------------
-PASS key rule: forge            premium            forge
-PASS key rule: lightwell        standard           lightwell
-PASS spoof stripped             standard           lightwell
-PASS saturation: 1st premium    premium            meridian
-PASS saturation: 2nd premium    premium            meridian
-PASS saturation: demoted        best-effort        meridian
+     case                         model        objective      fairness-id
+---- ---------------------------- ------------ -------------- ------------
+PASS key policy: forge            gemma-4      premium        forge
+PASS key policy: lightwell        gemma-4      standard       lightwell
+PASS spoof stripped               gemma-4      standard       lightwell
+PASS default policy: drift        gemma-4      premium        drift
+PASS key policy: atlas            gemma-4      premium        atlas
+PASS token x model: atlas         gemma-4-mini standard       atlas
+PASS team policy: nomad           gemma-4      standard       nomad
+PASS team x model: nomad          gemma-4-mini best-effort    nomad
+PASS team default: demoted        gemma-4      best-effort    nomad
+PASS team default: per key        gemma-4      standard       ember
+PASS saturation: 1st premium      gemma-4      premium        meridian
+PASS saturation: 2nd premium      gemma-4      premium        meridian
+PASS saturation: demoted          gemma-4      standard       meridian
+PASS per-model: 1st premium       gemma-4      premium        harbor
+PASS per-model: 2nd premium       gemma-4      premium        harbor
+PASS per-model: demoted           gemma-4      standard       harbor
+PASS per-model: mini untouched    gemma-4-mini premium        harbor
 
 all cases passed
 ```
@@ -53,7 +67,7 @@ Each row is a real request through the proxy; the objective and fairness id
 shown are what the **gateway received**, read back out of the mock's response --
 not what the proxy logged it intended to send.
 
-The last row is the one that matters: that request went out with
+The `spoof stripped` row is the one that matters: that request went out with
 
 ```
 -H "x-llm-d-inference-objective: premium"
@@ -65,25 +79,57 @@ on a key mapped to `standard`, and the gateway still saw `standard` / `lightwell
 this is tested the hard way -- with that on and the hook removed, the mock sees
 the spoofed values verbatim.
 
-## The mapping
+## Policies and the mapping
 
-`objectives.yaml`, most specific first: **key alias -> user -> team -> default**.
-The POC exercises only the `keys` tier, with one key per band:
+`objectives.yaml` defines named **policies** -- an objective plus an optional
+demotion rule -- and assigns one per identity:
 
 ```yaml
+policies:
+  default:                  # interactive: premium, degrade to standard near the limit
+    objective: premium
+    demote_at: 0.8
+    demote_to: standard
+  async:                    # batch: standard, degrade to best-effort near the limit
+    objective: standard
+    demote_at: 0.5
+    demote_to: best-effort
+
 defaults:
-  objective: standard
+  policy: default
   fairness_id_from: key_alias
 
 keys:
   forge:
-    objective: premium
+    policy: default
   lightwell:
-    objective: standard
+    policy: async
+    models:                 # token x model override: policy name or inline mapping
+      "gemma-4-mini": best-effort
+
+teams:
+  team-photon:
+    policy: async
+    models:                 # team x model override, same shape
+      "gemma-4-mini": best-effort
 ```
 
-`users:` and `teams:` sections slot in the same way, keyed by LiteLLM `user_id`
-and `team_id`, and are consulted in that order when no key rule matches.
+A team rule may also set `key_defaults:` -- see
+[Per-key defaults from the team](#per-key-defaults-from-the-team).
+
+Resolution is most specific first: **key alias -> user -> team -> default**
+(the first tier with a rule wins; `users:` is keyed by LiteLLM `user_id`,
+`teams:` by `team_id`). Within the matched tier, a `models:` override beats
+the tier's base policy -- so the same token runs `default` on its interactive
+model and `async` on its batch model. `models:` patterns are fnmatch globs,
+first match in declaration order wins.
+
+Everything layers field by field: a rule's policy is laid over the defaults'
+policy, and a model override over that, so an override that only changes
+`objective` inherits the rule's demotion settings. A rule may reference a
+named policy (`policy: async`), set the fields inline, or both (inline wins) --
+the pre-policy syntax `objective:` / `demote_at:` directly on a rule still
+works unchanged.
 
 Two knobs on the fairness id, which decides who competes with whom inside a
 band:
@@ -103,14 +149,14 @@ The hook keeps **no counters of its own**. The limits are LiteLLM's ordinary
 `tpm_limit` / `rpm_limit` on the key, user or team, and the numbers come from
 the v3 parallel request limiter's own tracking -- the same counters it mirrors
 into the `x-ratelimit-{descriptor}-{remaining,limit}-{requests,tokens}`
-response headers. A rule only adds the demotion policy:
+response headers. A policy only adds the demotion rule:
 
 ```yaml
-keys:
-  meridian:
+policies:
+  default:
     objective: premium
     demote_at: 0.004            # fraction of the caller's most-saturated limit
-    demote_to: best-effort      # optional; defaults to "best-effort"
+    demote_to: standard         # optional; defaults to "best-effort"
 ```
 
 Below `demote_at` the caller runs at its configured objective. Past it,
@@ -121,6 +167,82 @@ at 100% remains the backstop, so `demote_at` carves a soft band underneath it
 (realistic values are 0.5-0.9; the POC uses 0.004 = 4 of 1000 tokens so three
 requests cross it). The computed saturation is also forwarded as
 `x-litellm-ratelimit-saturation`, so downstream logic can make its own calls.
+
+### Per-model enforcement
+
+LiteLLM's limits can themselves be scoped per model -- `model_tpm_limit` /
+`model_rpm_limit` in key metadata (or team metadata for the team variant) give
+each key x model pair its own counter, which the v3 limiter tracks as a
+`model_per_key` / `model_per_team` descriptor. By default the hook demotes on
+the caller's *most saturated* limit, whichever that is; `demote_on` narrows
+the signal to specific descriptor kinds:
+
+```yaml
+policies:
+  per-model-default:
+    objective: premium
+    demote_at: 0.8
+    demote_to: standard
+    demote_on: [model_per_key]   # only the key's per-model counters count
+
+keys:
+  harbor:
+    policy: per-model-default
+```
+
+with the limits on the key itself (real LiteLLM, nothing POC-specific):
+
+```yaml
+harbor-key:
+  tpm_limit: 1000                # key-wide backstop
+  metadata:
+    model_tpm_limit:
+      gemma-4: 1000              # the counter demotion is driven by
+```
+
+The `per-model:` rows in the POC output show the effect: three requests
+saturate harbor's `gemma-4` counter and the third is demoted, while the next
+request to `gemma-4-mini` -- same key, same window, key-wide counter already
+past `demote_at` -- still goes out `premium`, because only the per-model
+counters feed the decision. Valid `demote_on` values are the limiter's
+descriptor keys: `api_key`, `user`, `team`, `team_member`, `end_user`,
+`model_per_key`, `model_per_team`.
+
+### Per-key defaults from the team
+
+Demotion needs limits on the caller, and setting them on every key is toil.
+LiteLLM's own team-level knob doesn't help here: `team_tpm_limit` is **one
+counter shared by the whole team**, so one noisy key drags everyone past
+`demote_at`. A team rule's `key_defaults:` instead gives every member key its
+**own** limits without per-key configuration:
+
+```yaml
+teams:
+  team-photon:
+    policy: async
+    key_defaults:
+      tpm_limit: 1000       # each member key gets its own 1000 TPM
+```
+
+Any limit the key row already carries wins -- these are defaults, not caps.
+Supported fields: `tpm_limit`, `rpm_limit`, `max_parallel_requests`, and the
+per-model `model_tpm_limit` / `model_rpm_limit` (so a team can default
+per-key-per-model limits too, feeding the `demote_on: [model_per_key]`
+scoping above).
+
+Mechanically, the hook fills the missing fields in on the request's
+`UserAPIKeyAuth` before LiteLLM's built-in hooks run; the v3 limiter then
+enforces and tracks them exactly as if the key row carried them -- hard 429 at
+100%, `x-ratelimit-*` headers, and the saturation counters demotion reads.
+The defaults are applied on every request through the proxy, not just
+llm-d-routed models, so accounting stays uniform. The `team default:` rows in
+the POC output show two limitless keys on the same team demoting
+independently: `nomad` crosses its own counter and degrades to best-effort
+while `ember` still runs standard.
+
+`key_defaults` applies to the team's keys whichever tier wins the *policy*
+resolution -- limits and policies are orthogonal; a key with its own `keys:`
+policy rule still inherits its team's default limits.
 
 How the read works, cheapest path first:
 
@@ -156,7 +278,9 @@ Only the two edges. The hook and the mapping are unchanged:
   keys, so the POC needs no Postgres. Real keys populate the same
   `key_alias` / `user_id` / `team_id` fields the hook reads, created with the
   aliases `objectives.yaml` expects:
-  `litellm keys create --key-alias forge --team-id team-platform`.
+  `litellm keys create --key-alias forge --team-id team-platform`. The limits
+  are ordinary key/team settings too, per-model ones included
+  (`--tpm-limit`, or `model_tpm_limit` in key/team metadata).
 - **Upstream.** `api_base` points at `mock_llmd.py` instead of the real
   inference gateway, and `forward_client_headers_to_llm_api` would go back to
   `false` -- the hook strips the two flow control headers either way, but with
@@ -167,6 +291,9 @@ Only the two edges. The hook and the mapping are unchanged:
 - **The objectives must exist.** `objective:` values have to match an
   `InferenceObjective` in the model's namespace; the proxy does not validate
   them, so a typo is only visible at the EPP.
+- **A typo'd policy name only warns.** A `policy:` reference that doesn't
+  match anything in `policies:` is logged and contributes nothing -- the
+  caller runs on whatever the `defaults:` layer provides.
 - **Pass-through routes bypass the hook.** It runs on LiteLLM's common request
   path (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
   `/v1/responses`). Anything routed through a LiteLLM pass-through endpoint
@@ -176,17 +303,29 @@ Only the two edges. The hook and the mapping are unchanged:
   needs a NetworkPolicy or gateway-level auth.
 - **The saturation read leans on private LiteLLM APIs.** `should_rate_limit`,
   `_create_rate_limit_descriptors` and the request stash are internals of the
-  v3 limiter, verified against litellm 1.99.0. An upgrade can break the read;
+  v3 limiter, verified against litellm 1.100.1. An upgrade can break the read;
   when it does, the hook logs a warning and keeps injecting the configured
   objective -- demotion silently stops until the call sites are re-checked.
-- **Demotion needs limits to exist.** No `tpm_limit`/`rpm_limit` on the key,
-  user or team means no descriptors, no counters, no saturation signal. And
-  because the v3 limiter still enforces the hard 429 at 100%, `demote_at`
-  must be below 1.0 to buy any soft band at all.
+- **Demotion needs limits to exist.** No `tpm_limit`/`rpm_limit` (or their
+  per-model `model_tpm_limit`/`model_rpm_limit` variants) on the key, user or
+  team -- and none defaulted in by the team's `key_defaults:` -- means no
+  descriptors, no counters, no saturation signal. A `demote_on` scope that
+  matches none of the caller's limits is the same as no signal. Because the
+  v3 limiter still enforces the hard 429 at 100%, `demote_at` must be below
+  1.0 to buy any soft band at all.
+- **`key_defaults` rides on hook ordering.** It mutates the request's
+  `UserAPIKeyAuth` and counts on config callbacks running before LiteLLM's
+  built-in hooks (they do; the POC's `team default:` cases prove it end to
+  end, since demotion only fires if the limiter tracked the defaulted limit).
+  If a LiteLLM upgrade flips that ordering, the defaults stop being enforced
+  -- keys with no limits of their own just lose the saturation signal and the
+  429 backstop, they don't fail.
 - **Saturation is per LiteLLM identity, not per rule.** The counters belong to
-  the key/user/team that carries the limit. A team-wide grant is a
-  `team_tpm_limit`; a `demote_at` on a `teams:` rule then demotes members off
-  the shared team counter.
+  the key/user/team (or key x model / team x model) that carries the limit. A
+  team-wide grant is a `team_tpm_limit`; a `demote_at` on a `teams:` rule then
+  demotes members off the shared team counter. `demote_on` picks *which* of
+  the caller's counters feed the decision; it cannot conjure counters the
+  caller's limits don't create.
 - **Demotion needs the demoted objective to exist too.** `demote_to` values
   are `InferenceObjective` names like any other; the EPP decides what an
   unresolvable one means.
